@@ -2,12 +2,12 @@
 
 ## Problem Description
 
-When using OrcaSlicer with Bambu Lab printers, the print dialog shows different name formats depending on the platform and connection mode:
+When using OrcaSlicer with Bambu Lab printers, users cannot rename LAN-only printers, forcing them to work with cryptic device IDs instead of user-friendly names:
 
-- **macOS**: Shows user-friendly names like "My Bambu Printer"
-- **Windows**: Shows device IDs/serial numbers like "01P00A123456789A"
+- **Cloud-connected printers**: ✅ Can be renamed, show custom names like "My Workshop Printer"
+- **LAN-only printers**: ❌ Cannot be renamed, show device IDs like "01P00A123456789A"
 
-This inconsistency makes it difficult to identify printers, especially when managing multiple devices.
+This makes it extremely difficult to identify printers, especially when managing multiple devices in LAN-only mode.
 
 ## Root Cause Analysis
 
@@ -23,118 +23,274 @@ From [Bambu Lab community forum](https://forum.bambulab.com/t/how-rename-printer
 
 ### Technical Root Cause
 
-The issue occurs in the network discovery process where printer names are retrieved:
+**The rename functionality already exists in OrcaSlicer** but is artificially disabled for LAN-only printers:
 
-**File**: `src/slic3r/GUI/DeviceManager.cpp` (line ~6185)
+1. **UI Elements Exist**: Edit button (`m_edit_name_img`) and dialog (`EditDevNameDialog`) are implemented
+2. **Cloud Dependency**: Rename function calls `modify_printer_name()` which requires cloud API access
+3. **Conditional Display**: Edit button only shown when `mobj->is_online()` AND printer is cloud-connected
+4. **No Local Storage**: No mechanism to store custom names locally for LAN-only printers
+
+### Current Code Flow
+
+**File**: `src/slic3r/GUI/SelectMachinePop.cpp` (line ~717)
 ```cpp
-std::string dev_name = j["dev_name"].get<std::string>();
+if (!mobj->is_online()) {
+    op->SetToolTip(_L("Offline"));
+    op->set_printer_state(PrinterState::OFFLINE);
+} else {
+    op->show_edit_printer_name(true);  // Only for cloud-connected printers
+    op->show_printer_bind(true, PrinterBindState::ALLOW_UNBIND);
+    // ...
+}
 ```
 
-**Connection Mode Behavior**:
-- **Cloud-connected**: `dev_name` contains user-set friendly names
-- **LAN-only mode**: `dev_name` contains raw device identifiers (serial numbers)
-
-### Code Flow Analysis
-
-1. **Discovery**: `DeviceManager::on_machine_alive()` parses JSON and sets `obj->dev_name`
-2. **Display**: `SelectMachine.cpp` line 2362 directly displays raw `dev_name`:
-   ```cpp
-   wxString dev_name_text = from_u8(it->second->dev_name);
-   ```
-3. **Result**: LAN-only printers show cryptic device IDs instead of friendly names
-
-## Available Data Fields
-
-The `MachineObject` class contains additional fields that can be used for friendly names:
-
+**File**: `src/slic3r/GUI/SelectMachinePop.cpp` (line ~958)
 ```cpp
-// From DeviceManager.hpp
-std::string dev_name;           // Raw device name (problematic for LAN-only)
-std::string printer_type;       // Model ID (e.g., "C11")  
-std::string product_name;       // Product name from discovery
-wxString get_printer_type_display_str(); // Formatted display name (e.g., "Bambu Lab X1 Carbon")
+// EditDevNameDialog::on_edit_name() calls:
+dev->modify_device_name(m_info->dev_id, name);  // Requires cloud API
 ```
-
-**JSON Fields Available** (from `DeviceManager.cpp` line ~6690):
-- `dev_name` - Raw device identifier
-- `dev_model_name` - Model identifier 
-- `dev_product_name` - Product name
-- `dev_type` - Printer type string
 
 ## Solution Implementation
 
-### File to Modify
-`src/slic3r/GUI/SelectMachine.cpp`
+### Overview
+Enable the existing rename button for LAN-only printers by:
+1. **Adding local storage** for custom printer names
+2. **Showing edit button** for all online printers (cloud AND LAN)
+3. **Dual save logic** - cloud API for cloud printers, local storage for LAN printers
+4. **Display priority** - show custom names when available, fall back to device names
 
-### Required Changes
+### Files to Modify
 
-#### 1. Add Include Statement
-At the top of `SelectMachine.cpp`, add:
+#### 1. Add Local Storage for Custom Names
+
+**File**: `src/libslic3r/AppConfig.hpp`
+
+Add to class AppConfig:
 ```cpp
-#include <algorithm>  // for std::all_of
+// Custom printer name storage
+std::map<std::string, std::string> get_custom_printer_names();
+void set_custom_printer_name(const std::string& dev_id, const std::string& custom_name);
+std::string get_custom_printer_name(const std::string& dev_id);
+void remove_custom_printer_name(const std::string& dev_id);
 ```
 
-#### 2. Replace Line ~2362
-**Current code:**
-```cpp
-wxString dev_name_text = from_u8(it->second->dev_name);
-```
+**File**: `src/libslic3r/AppConfig.cpp`
 
-**New code:**
+Add to save/load methods:
 ```cpp
-// Create a user-friendly display name
-wxString dev_name_text;
-std::string raw_dev_name = it->second->dev_name;
-
-#ifdef _WIN32
-// On Windows, if dev_name looks like a device ID (alphanumeric only, >8 chars),
-// create a friendlier name using printer type info
-if (raw_dev_name.length() > 8 && 
-    std::all_of(raw_dev_name.begin(), raw_dev_name.end(), 
-    [](char c) { return std::isalnum(c); })) {
-    
-    // Use printer type display string if available
-    wxString printer_type_display = it->second->get_printer_type_display_str();
-    if (!printer_type_display.IsEmpty() && printer_type_display != _L("Unknown")) {
-        // Show "Printer Type (last 4 chars of ID)"
-        std::string short_id = raw_dev_name.length() > 4 ? 
-            raw_dev_name.substr(raw_dev_name.length() - 4) : raw_dev_name;
-        dev_name_text = wxString::Format("%s (%s)", printer_type_display, short_id);
-    } else if (!it->second->product_name.empty()) {
-        // Fallback to product name if available
-        std::string short_id = raw_dev_name.length() > 4 ? 
-            raw_dev_name.substr(raw_dev_name.length() - 4) : raw_dev_name;
-        dev_name_text = wxString::Format("%s (%s)", 
-            wxString::FromUTF8(it->second->product_name), short_id);
-    } else {
-        // Last resort: use raw name
-        dev_name_text = from_u8(raw_dev_name);
+// In save() method, add:
+if (!m_custom_printer_names.empty()) {
+    json custom_names_json;
+    for (const auto& pair : m_custom_printer_names) {
+        custom_names_json[pair.first] = pair.second;
     }
-} else {
-    // Use raw name if it looks user-friendly already
-    dev_name_text = from_u8(raw_dev_name);
+    m_json["custom_printer_names"] = custom_names_json;
 }
-#else
-// On macOS and other platforms, use the raw name as it's already friendly
-dev_name_text = from_u8(raw_dev_name);
-#endif
+
+// In load() method, add:
+if (m_json.contains("custom_printer_names") && m_json["custom_printer_names"].is_object()) {
+    m_custom_printer_names.clear();
+    for (auto& item : m_json["custom_printer_names"].items()) {
+        m_custom_printer_names[item.key()] = item.value().get<std::string>();
+    }
+}
+
+// Implement helper methods:
+std::map<std::string, std::string> AppConfig::get_custom_printer_names() {
+    return m_custom_printer_names;
+}
+
+void AppConfig::set_custom_printer_name(const std::string& dev_id, const std::string& custom_name) {
+    if (custom_name.empty()) {
+        m_custom_printer_names.erase(dev_id);
+    } else {
+        m_custom_printer_names[dev_id] = custom_name;
+    }
+    save();  // Auto-save changes
+}
+
+std::string AppConfig::get_custom_printer_name(const std::string& dev_id) {
+    auto it = m_custom_printer_names.find(dev_id);
+    return (it != m_custom_printer_names.end()) ? it->second : "";
+}
+
+void AppConfig::remove_custom_printer_name(const std::string& dev_id) {
+    m_custom_printer_names.erase(dev_id);
+    save();
+}
 ```
 
-### Logic Explanation
+Add private member variable:
+```cpp
+std::map<std::string, std::string> m_custom_printer_names;
+```
 
-1. **Detects Windows platform** using `#ifdef _WIN32`
-2. **Identifies device ID format** - checks if name is all alphanumeric and >8 characters
-3. **Creates friendly names** using:
-   - Primary: `get_printer_type_display_str()` (e.g., "Bambu Lab X1 Carbon")
-   - Fallback: `product_name` field
-   - Last resort: Raw device name
-4. **Adds unique identifier** - appends last 4 characters of device ID
-5. **Preserves other platforms** - no change for macOS/Linux behavior
+#### 2. Enable Edit Button for LAN-Only Printers
 
-### Expected Results
+**File**: `src/slic3r/GUI/SelectMachinePop.cpp`
 
-**Before**: `01P00A123456789A`
-**After**: `Bambu Lab X1 Carbon (789A)`
+**Replace line ~717:**
+```cpp
+// OLD CODE:
+if (!mobj->is_online()) {
+    op->SetToolTip(_L("Offline"));
+    op->set_printer_state(PrinterState::OFFLINE);
+} else {
+    op->show_edit_printer_name(true);  // Only for cloud printers
+    op->show_printer_bind(true, PrinterBindState::ALLOW_UNBIND);
+    // ...
+}
+
+// NEW CODE:
+if (!mobj->is_online()) {
+    op->SetToolTip(_L("Offline"));
+    op->set_printer_state(PrinterState::OFFLINE);
+} else {
+    // Show edit button for ALL online printers (cloud AND LAN)
+    op->show_edit_printer_name(true);
+    op->show_printer_bind(true, PrinterBindState::ALLOW_UNBIND);
+    // ...
+}
+```
+
+#### 3. Enhance EditDevNameDialog for Dual Save Logic
+
+**File**: `src/slic3r/GUI/SelectMachinePop.cpp`
+
+**Replace `EditDevNameDialog::on_edit_name()` method around line 958:**
+```cpp
+void EditDevNameDialog::on_edit_name(wxCommandEvent &e)
+{
+    m_static_valid->SetLabel(wxEmptyString);
+    auto     m_valid_type = Valid;
+    wxString info_line;
+    auto     new_dev_name = m_textCtr->GetTextCtrl()->GetValue();
+
+    // Existing validation code (keep unchanged)
+    const char *      unusable_symbols = "<>[]:/\\|?*\"";
+    const std::string unusable_suffix  = PresetCollection::get_suffix_modified();
+
+    for (size_t i = 0; i < std::strlen(unusable_symbols); i++) {
+        if (new_dev_name.find_first_of(unusable_symbols[i]) != std::string::npos) {
+            info_line    = _L("Name is invalid;") + _L("illegal characters:") + " " + unusable_symbols;
+            m_valid_type = NoValid;
+            break;
+        }
+    }
+
+    if (m_valid_type == Valid && new_dev_name.find(unusable_suffix) != std::string::npos) {
+        info_line    = _L("Name is invalid;") + _L("illegal suffix:") + "\n\t" + from_u8(PresetCollection::get_suffix_modified());
+        m_valid_type = NoValid;
+    }
+
+    if (m_valid_type == Valid && new_dev_name.empty()) {
+        info_line    = _L("The name is not allowed to be empty.");
+        m_valid_type = NoValid;
+    }
+
+    if (m_valid_type == Valid && new_dev_name.find_first_of(' ') == 0) {
+        info_line    = _L("The name is not allowed to start with space character.");
+        m_valid_type = NoValid;
+    }
+
+    if (m_valid_type == Valid && new_dev_name.find_last_of(' ') == new_dev_name.length() - 1) {
+        info_line    = _L("The name is not allowed to end with space character.");
+        m_valid_type = NoValid;
+    }
+
+    if (m_valid_type == NoValid) {
+        m_static_valid->SetLabel(info_line);
+        Layout();
+        return;
+    }
+
+    // NEW: Dual save logic
+    if (m_valid_type == Valid) {
+        m_static_valid->SetLabel(wxEmptyString);
+        auto utf8_str = new_dev_name.ToUTF8();
+        auto name = std::string(utf8_str.data(), utf8_str.length());
+        
+        if (m_info) {
+            if (m_info->is_lan_mode_printer()) {
+                // For LAN-only printers, save custom name locally
+                wxGetApp().app_config->set_custom_printer_name(m_info->dev_id, name);
+                BOOST_LOG_TRIVIAL(info) << "Saved custom name for LAN printer: " << m_info->dev_id << " -> " << name;
+            } else {
+                // For cloud printers, use existing cloud API
+                DeviceManager *dev = Slic3r::GUI::wxGetApp().getDeviceManager();
+                if (dev) {
+                    dev->modify_device_name(m_info->dev_id, name);
+                    BOOST_LOG_TRIVIAL(info) << "Updated cloud printer name: " << m_info->dev_id << " -> " << name;
+                }
+            }
+        }
+        DPIDialog::EndModal(wxID_CLOSE);
+    }
+}
+```
+
+#### 4. Update Display Logic in All Printer Selection Dialogs
+
+**File**: `src/slic3r/GUI/SelectMachine.cpp` (line ~2362)
+
+**Replace:**
+```cpp
+// OLD CODE:
+wxString dev_name_text = from_u8(it->second->dev_name);
+
+// NEW CODE:
+wxString dev_name_text;
+std::string custom_name = wxGetApp().app_config->get_custom_printer_name(it->second->dev_id);
+if (!custom_name.empty()) {
+    // Use custom name if available
+    dev_name_text = from_u8(custom_name);
+} else {
+    // Fall back to device name
+    dev_name_text = from_u8(it->second->dev_name);
+}
+```
+
+**Apply similar changes to:**
+- `src/slic3r/GUI/SendToPrinter.cpp` (line ~906)
+- `src/slic3r/GUI/CalibrationPanel.cpp` (line ~114)
+- `src/slic3r/GUI/BindDialog.cpp` (line ~923)
+
+#### 5. Update EditDevNameDialog Pre-fill Logic
+
+**File**: `src/slic3r/GUI/SelectMachinePop.cpp` (around line 900)
+
+**Update `EditDevNameDialog::set_machine_obj()` method:**
+```cpp
+void EditDevNameDialog::set_machine_obj(MachineObject *obj)
+{
+    m_info = obj;
+    if (m_info) {
+        // Pre-fill with custom name if available, otherwise use device name
+        std::string display_name = wxGetApp().app_config->get_custom_printer_name(m_info->dev_id);
+        if (display_name.empty()) {
+            display_name = m_info->dev_name;
+        }
+        m_textCtr->GetTextCtrl()->SetValue(from_u8(display_name));
+    }
+}
+```
+
+## Expected User Experience
+
+### Before Fix
+- **Cloud printers**: ✅ Edit button visible, can rename, shows custom names
+- **LAN-only printers**: ❌ No edit button, shows device IDs like `01P00A123456789A`
+
+### After Fix  
+- **Cloud printers**: ✅ Edit button visible, can rename, shows custom names (unchanged behavior)
+- **LAN-only printers**: ✅ Edit button visible, can rename, shows custom names like `"Workshop X1 Carbon"`
+
+### User Workflow
+1. **Connect LAN-only printer** - initially shows device ID
+2. **Click edit button** (pencil icon) next to unbind button
+3. **Enter custom name** - "My Workshop Printer"
+4. **Name persists** across app restarts and reconnections
+5. **All dialogs show custom name** consistently
 
 ## Build Instructions
 
@@ -155,88 +311,73 @@ OrcaSlicer.exe
 
 ## Testing Plan
 
-### Primary Test Case
-1. **Setup**: Bambu printer in LAN-only mode showing device ID
-2. **Test**: Open modified OrcaSlicer → Device tab → Check printer dropdown
-3. **Expected**: See "Bambu Lab X1 Carbon (1234)" instead of device ID
+### Primary Test Cases
 
-### Test Scenarios
+#### A. LAN-Only Printer Renaming
+1. **Setup**: Bambu printer in LAN-only mode 
+2. **Test**: Device tab → Find printer → Click edit button (pencil icon)
+3. **Expected**: 
+   - Edit dialog opens with current name pre-filled
+   - Can enter custom name and save
+   - Name appears immediately in all dialogs
+   - Name persists after app restart
 
-#### A. LAN-Only Printers (Primary Issue)
-- ✅ Device IDs become friendly names
-- ✅ Unique identifiers preserved for multiple same-model printers
-- ✅ "(LAN)" indicator still appears
+#### B. Cloud Printer Compatibility (Regression Test)
+1. **Setup**: Cloud-connected Bambu printer
+2. **Test**: Rename using edit button
+3. **Expected**: 
+   - Works exactly as before
+   - Uses cloud API (not local storage)
+   - Name syncs across devices
 
-#### B. Cloud-Connected Printers (Regression Test)
-- ✅ Existing user-friendly names unchanged
-- ✅ No impact on cloud-connected printer behavior
-
-#### C. Edge Cases
-- ✅ Short names (<8 chars) use raw name
-- ✅ Names with special characters use raw name
-- ✅ Missing printer type/product name falls back gracefully
-- ✅ Performance unchanged
-
-### Debug Testing
-Add temporary logging to verify code execution:
-```cpp
-#ifdef _WIN32
-    BOOST_LOG_TRIVIAL(info) << "Original dev_name: " << raw_dev_name;
-    BOOST_LOG_TRIVIAL(info) << "Formatted name: " << dev_name_text.ToStdString();
-    BOOST_LOG_TRIVIAL(info) << "Printer type: " << it->second->get_printer_type_display_str().ToStdString();
-#endif
-```
+#### C. Mixed Environment
+1. **Setup**: Both LAN-only and cloud-connected printers
+2. **Test**: Rename both types independently
+3. **Expected**: 
+   - Each uses appropriate storage method
+   - Names display correctly in all dialogs
+   - No cross-contamination
 
 ### Validation Checklist
-- [ ] Print job submission works
-- [ ] Printer selection functions correctly  
-- [ ] Device monitoring unchanged
+- [ ] LAN-only printers show edit button when online
+- [ ] Custom names save and load correctly
+- [ ] All printer selection dialogs show custom names
+- [ ] Cloud printer renaming still works (no regression)
+- [ ] Names persist across app restarts
+- [ ] Config file updates properly
 - [ ] UI responsive and properly formatted
 - [ ] No memory leaks or crashes
-- [ ] Startup performance unchanged
 
-## Additional Context
+## Data Storage Details
 
-### Related Code Locations
-
-**Other files that use `dev_name` for display**:
-- `src/slic3r/GUI/SendToPrinter.cpp` (line ~906)
-- `src/slic3r/GUI/CalibrationPanel.cpp` (line ~114)
-- `src/slic3r/GUI/SelectMachinePop.cpp` (line ~169)
-- `src/slic3r/GUI/BindDialog.cpp` (line ~923)
-
-*Note: May need similar fixes if same issue appears in these dialogs*
-
-### Alternative Name Sources
-If `get_printer_type_display_str()` doesn't provide good names, check:
-- `printer_type` field mapping in `MachineObject::get_preset_printer_model_name()`
-- Direct JSON fields: `dev_model_name`, `dev_product_name`
-
-### Bambu Printer Models
-Common models that benefit from this fix:
-- X1 Carbon, X1, P1P, P1S, A1 mini
-- All show device IDs in LAN-only mode
-
-## Rollback Plan
-
-```cmd
-# Backup original file before changes
-copy src\slic3r\GUI\SelectMachine.cpp src\slic3r\GUI\SelectMachine.cpp.backup
-
-# Restore if needed
-copy src\slic3r\GUI\SelectMachine.cpp.backup src\slic3r\GUI\SelectMachine.cpp
+### Config File Structure
+Custom names stored in `%APPDATA%/OrcaSlicer/orca-slicer.conf`:
+```json
+{
+  "custom_printer_names": {
+    "01P00A123456789A": "Workshop X1 Carbon",
+    "01P00B987654321B": "Prototyping P1S",
+    "01P00C555444333C": "Production Line 1"
+  }
+}
 ```
 
-## Future Considerations
+## Summary
 
-1. **Upstream Contribution**: Consider submitting this fix to the main OrcaSlicer repository
-2. **Bambu Lab Feature Request**: LAN-only printer renaming capability
-3. **Configuration Option**: Add user preference for name display format
-4. **Additional Dialogs**: Apply similar fixes to other printer selection dialogs
+This solution **enables the existing rename button for LAN-only printers** by adding local storage for custom names. It's a user-controlled, persistent solution that doesn't require cloud connectivity while preserving all existing functionality for cloud-connected printers.
+
+**Key advantages:**
+- ✅ Uses familiar existing UI (edit button + dialog)
+- ✅ Works offline for LAN-only printers  
+- ✅ Persistent across app restarts
+- ✅ No regression for cloud printers
+- ✅ User has full control over naming
+- ✅ Clean fallback to device names
 
 ## References
 
 - [Bambu Lab Forum: How to rename printer](https://forum.bambulab.com/t/how-rename-printer-or-is-that-a-no-no/4693)
 - [OrcaSlicer Source Code](https://github.com/SoftFever/OrcaSlicer)
-- Device discovery implementation: `src/slic3r/GUI/DeviceManager.cpp`
+- Edit button implementation: `src/slic3r/GUI/SelectMachinePop.cpp`
+- Config storage: `src/libslic3r/AppConfig.cpp`
 - Printer selection UI: `src/slic3r/GUI/SelectMachine.cpp` 
